@@ -11,7 +11,8 @@ qpm restore
 qpm s build
 qpm s qmod
 ```
-this is still very buggy, just less buggy than original vivify. expect bugs, expect crashes
+this is still very buggy, just less buggy than the 0.1 vivify. expect bugs, expect crashes
 
 
 in 0.3.0 there is a bug with restarting in pause menu it crashes the game so just dont do that until fixed :)
+
