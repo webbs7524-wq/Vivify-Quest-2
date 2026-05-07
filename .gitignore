@@ -1,0 +1,19 @@
+# Build outputs
+build/
+*.qmod
+mod.json
+
+# QPM restored dependencies. Run `qpm restore` to regenerate these locally.
+extern/
+shared/
+ndkpath.txt
+
+# Native binaries should never be committed to GitHub directly.
+*.so
+*.a
+*.debug.so
+
+# Local/editor noise
+.vs/
+.vscode/
+*.log

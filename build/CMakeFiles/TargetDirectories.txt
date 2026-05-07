@@ -1,3 +1,0 @@
-C:/Users/webbs/Downloads/Vivify-Quest-0.3.0/build/CMakeFiles/vivify.dir
-C:/Users/webbs/Downloads/Vivify-Quest-0.3.0/build/CMakeFiles/edit_cache.dir
-C:/Users/webbs/Downloads/Vivify-Quest-0.3.0/build/CMakeFiles/rebuild_cache.dir
