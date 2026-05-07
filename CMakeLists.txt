@@ -65,6 +65,8 @@ add_library(
         ${c_file_list}
 )
 
+include(${CMAKE_CURRENT_SOURCE_DIR}/extern.cmake)
+
 # for inline hook
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE -llog)
 
