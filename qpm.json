@@ -6,8 +6,8 @@
   "info": {
     "name": "Vivify",
     "id": "vivify",
-    "version": "0.3.0",
-    "url": "https://github.com/axo-lotl/Vivify-Quest",
+    "version": "0.4.1",
+    "url": "https://github.com/Lookingforscripts1/Vivify-Quest3.0fork/",
     "additionalData": {
       "overrideSoName": "libvivify.so",
       "cmake": true
@@ -16,29 +16,29 @@
   "workspace": {
     "scripts": {
       "build": [
-        "powershell -ExecutionPolicy Bypass -File ./scripts/build.ps1"
+        "pwsh ./scripts/build.ps1"
       ],
       "clean": [
-        "powershell -ExecutionPolicy Bypass -File ./scripts/build.ps1 -clean"
+        "pwsh ./scripts/build.ps1 -clean"
       ],
       "copy": [
-        "powershell -ExecutionPolicy Bypass -File ./scripts/copy.ps1 $0:?"
+        "pwsh ./scripts/copy.ps1 $0:?"
       ],
       "logcat": [
-        "powershell -ExecutionPolicy Bypass -File ./scripts/start-logging.ps1"
+        "pwsh ./scripts/start-logging.ps1"
       ],
       "qmod": [
-        "powershell -ExecutionPolicy Bypass -File ./scripts/build.ps1",
-        "powershell -ExecutionPolicy Bypass -File ./scripts/createqmod.ps1"
+        "pwsh ./scripts/build.ps1",
+        "pwsh ./scripts/createqmod.ps1"
       ],
       "restart": [
-        "powershell -ExecutionPolicy Bypass -File ./scripts/restart-game.ps1"
+        "pwsh ./scripts/restart-game.ps1"
       ],
       "stack": [
-        "powershell -ExecutionPolicy Bypass -File ./scripts/ndk-stack.ps1"
+        "pwsh ./scripts/ndk-stack.ps1"
       ],
       "tomb": [
-        "powershell -ExecutionPolicy Bypass -File ./scripts/pull-tombstone.ps1"
+        "pwsh ./scripts/pull-tombstone.ps1"
       ]
     },
     "ndk": "^27.3.13750724",
@@ -133,3 +133,5 @@
     }
   ]
 }
+
+

@@ -15,4 +15,3 @@ bool GetDisableCreateCameraDepth();
 bool GetDisableVRCenterAdjust();
 void SetMultipassRenderingEnabled(bool enabled);
 void EnsureConfigDefaults();
-constexpr auto PaperLogger = Paper::ConstLoggerContext("Vivify");

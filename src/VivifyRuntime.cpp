@@ -415,6 +415,9 @@ constexpr std::string_view kSetAnimatorPropertyEvent = "SetAnimatorProperty"sv;
 constexpr std::string_view kSetGlobalPropertyEvent = "SetGlobalProperty"sv;
 constexpr std::string_view kAssignObjectPrefabEvent = "AssignObjectPrefab"sv;
 constexpr std::string_view kBlitEvent = "Blit"sv;
+constexpr std::string_view kPostProcessEvent = "PostProcess"sv;
+constexpr std::string_view kPostProcessingEvent = "PostProcessing"sv;
+constexpr std::string_view kScreenEffectEvent = "ScreenEffect"sv;
 constexpr std::string_view kCreateCameraEvent = "CreateCamera"sv;
 constexpr std::string_view kCreateScreenTextureEvent = "CreateScreenTexture"sv;
 constexpr std::string_view kSetCameraPropertyEvent = "SetCameraProperty"sv;
@@ -582,11 +585,15 @@ struct ActiveSaberVisual {
 bool IsVivifyEvent(std::string_view type) {
   return type == kInstantiatePrefabEvent || type == kDestroyObjectEvent || type == kSetMaterialPropertyEvent ||
          type == kSetAnimatorPropertyEvent || type == kSetGlobalPropertyEvent || type == kAssignObjectPrefabEvent ||
-         type == kBlitEvent || type == kCreateCameraEvent || type == kCreateScreenTextureEvent ||
-         type == kSetCameraPropertyEvent || type == kSetRenderingSettingsEvent;
+         type == kBlitEvent || type == kPostProcessEvent || type == kPostProcessingEvent || type == kScreenEffectEvent ||
+         type == kCreateCameraEvent || type == kCreateScreenTextureEvent || type == kSetCameraPropertyEvent ||
+         type == kSetRenderingSettingsEvent;
 }
 bool IsSupportedEvent(std::string_view type) {
   return IsVivifyEvent(type);
+}
+bool IsPostProcessingEvent(std::string_view type) {
+  return type == kBlitEvent || type == kPostProcessEvent || type == kPostProcessingEvent || type == kScreenEffectEvent;
 }
 std::string NormalizeAssetKey(std::string_view input) {
   std::string key(input);
@@ -1181,17 +1188,15 @@ private:
   void RefreshCameraComponents(bool allowCameraApplier) {
     auto mainCam = UnityEngine::Camera::get_main();
     auto mainCamGO = IsAlive(mainCam) ? mainCam->get_gameObject().unsafePtr() : nullptr;
+    if (IsAlive(mainCam)) {
+      if (auto props = _cameraProperties.find("_Main"); props != _cameraProperties.end()) {
+        ApplyCameraProperties(mainCam.unsafePtr(), props->second);
+      }
+    }
     RefreshMultipassRendering(mainCamGO);
     RefreshGameplayOverlayCamera(mainCam.unsafePtr(), mainCamGO,
                                  _currentBeatmapData != nullptr && !_isResetting && !_pauseMenuActive);
-    auto* finalCameraGO = mainCamGO;
-    if (_gameplayOverlayCamera != nullptr && UnityEngine::Object::op_Implicit_bool(_gameplayOverlayCamera)) {
-      auto* overlayGO = _gameplayOverlayCamera->get_gameObject().unsafePtr();
-      if (IsAlive(overlayGO)) {
-        finalCameraGO = overlayGO;
-      }
-    }
-    RefreshCameraApplier(finalCameraGO, allowCameraApplier);
+    RefreshCameraApplier(mainCamGO, allowCameraApplier);
   }
   void RefreshMultipassRendering(UnityEngine::GameObject* mainCamGO) {
     if (IsAlive(mainCamGO)) {
@@ -1484,8 +1489,8 @@ private:
       HandleSetAnimatorProperty(customEventData, *json);
     } else if (type == kSetGlobalPropertyEvent) {
       HandleSetGlobalProperty(customEventData, *json);
-    } else if (type == kBlitEvent) {
-      HandleBlit(customEventData, *json);
+    } else if (IsPostProcessingEvent(type)) {
+      HandleBlit(customEventData, *json, type);
     } else if (type == kCreateCameraEvent) {
       HandleCreateCamera(*json);
     } else if (type == kCreateScreenTextureEvent) {
@@ -2116,11 +2121,20 @@ private:
     auto* customNoteData = il2cpp_utils::try_cast<CustomJSONData::CustomNoteData>(noteData).value_or(nullptr);
     if (customNoteData == nullptr || customNoteData->customData == nullptr) return false;
     auto& ad = TracksAD::getAD(customNoteData->customData);
-    if (ad.tracks.empty()) return false;
-    for (auto const& noteTrack : ad.tracks) {
-      for (auto const& assignedTrack : info.tracks) {
-        if (noteTrack == assignedTrack) return true;
+    auto matches = [&](auto const& noteTracks) {
+      if (noteTracks.empty()) return false;
+      for (auto const& noteTrack : noteTracks) {
+        for (auto const& assignedTrack : info.tracks) {
+          if (noteTrack == assignedTrack) return true;
+        }
       }
+      return false;
+    };
+    if (matches(ad.tracks)) return true;
+    if (customNoteData->customData->value.has_value()) {
+      bool const v2 = _currentBeatmapData != nullptr && _currentBeatmapData->v2orEarlier;
+      auto parsedTracks = ReadTracks(customNoteData->customData->value.value().get(), v2);
+      if (matches(parsedTracks)) return true;
     }
     return false;
   }
@@ -2131,8 +2145,11 @@ private:
                          bool additive,
                          std::optional<int> saberType = std::nullopt) {
     if (asset.empty()) return;
-    auto* prefab = GetAssetAs<UnityEngine::GameObject>(asset);
-    if (prefab == nullptr || !UnityEngine::Object::op_Implicit_bool(prefab)) return;
+    // NOTE: Do NOT validate the asset here. GetValidPrefabInfos() validates at
+    // spawn time. Validating here causes silent drops when the bundle is loaded
+    // but the asset key doesn't match (e.g. short name vs full Unity path), or
+    // if there is any transient issue at event-fire time. Once dropped, the info
+    // is never retried and notes silently stay stock for the entire song.
     AssignedPrefabInfo info;
     info.asset = std::move(asset);
     info.tracks = std::move(tracks);
@@ -2166,14 +2183,27 @@ private:
     info.trailGranularity = granularity;
     _assignedPrefabs.push_back(std::move(info));
   }
+  bool TracksOverlap(std::vector<TrackW> const& left, std::vector<TrackW> const& right) const {
+    if (left.empty() || right.empty()) return false;
+    for (auto const& leftTrack : left) {
+      for (auto const& rightTrack : right) {
+        if (leftTrack == rightTrack) return true;
+      }
+    }
+    return false;
+  }
   void ClearAssignedPrefabs(std::string_view objectType,
                             std::optional<AssignedPrefabKind> kind = std::nullopt,
-                            std::optional<int> saberType = std::nullopt) {
+                            std::optional<int> saberType = std::nullopt,
+                            std::vector<TrackW> const* tracks = nullptr) {
     _assignedPrefabs.erase(std::remove_if(_assignedPrefabs.begin(), _assignedPrefabs.end(),
-        [objectType, kind, saberType](AssignedPrefabInfo const& info) {
+        [this, objectType, kind, saberType, tracks](AssignedPrefabInfo const& info) {
           if (info.objectType != objectType) return false;
           if (kind.has_value() && info.kind != kind.value()) return false;
           if (saberType.has_value() && (!info.saberType.has_value() || info.saberType.value() != saberType.value())) return false;
+          if (tracks != nullptr && !tracks->empty() && !info.tracks.empty() && !TracksOverlap(info.tracks, *tracks)) {
+            return false;
+          }
           return true;
         }),
         _assignedPrefabs.end());
@@ -2231,18 +2261,24 @@ private:
   }
   UnityEngine::Transform* GetReplacementParent(GlobalNamespace::NoteController* noteController) {
     if (!IsAlive(noteController)) return nullptr;
-    auto transform = noteController->get_transform();
-    auto* rawTransform = transform.unsafePtr();
-    if (!IsAlive(rawTransform)) return nullptr;
-    if (UsesNoteVisualChild(noteController) && rawTransform->get_childCount() > 0) {
-      return rawTransform->GetChild(0).unsafePtr();
-    }
-    return rawTransform;
+    // Use the explicit _noteTransform backing field (offset 0x28), exactly as
+    // the old version did. The previous GetChild(0) approach was fragile: if
+    // NoteMovement or any other object occupies child slot 0 of the root, the
+    // replacement prefab lands in the wrong part of the hierarchy and becomes
+    // invisible or mispositioned.
+    auto* noteTransform = noteController->_noteTransform.unsafePtr();
+    if (IsAlive(noteTransform)) return noteTransform;
+    // Fallback to root transform if _noteTransform is unset (e.g. BombNote).
+    auto rootTransform = noteController->get_transform();
+    return rootTransform.unsafePtr();
   }
   GlobalNamespace::MaterialPropertyBlockController* GetReplacementMaterialPropertyBlockController(
       GlobalNamespace::NoteController* noteController, UnityEngine::Transform* replacementParent) {
     if (!IsAlive(noteController)) return nullptr;
-    if (UsesNoteVisualChild(noteController) && IsAlive(replacementParent)) {
+    // Try the replacement parent's GameObject first (works for both
+    // GameNoteController and BombNoteController since we now always pass the
+    // correct visual transform via GetReplacementParent).
+    if (IsAlive(replacementParent)) {
       auto parentObject = replacementParent->get_gameObject();
       if (IsAlive(parentObject.unsafePtr())) {
         auto* childMpb = parentObject->GetComponent<GlobalNamespace::MaterialPropertyBlockController*>();
@@ -3267,13 +3303,13 @@ MAKE_HOOK_MATCH(GameNoteController_Init, &GlobalNamespace::GameNoteController::I
   GameNoteController_Init(self, noteData, noteSpawnData, noteVisualModifierType, cutAngleTolerance, uniformScale);
   Runtime::Instance().RestoreNoteVisuals(self);
   if (Runtime::Instance().GetCurrentBeatmapData() == nullptr || Runtime::Instance().IsResetting()) return;
-  Runtime::Instance().ForceGameObjectRenderersOnTop(self->get_gameObject().unsafePtr());
   if (noteData == nullptr || noteData->get_gameplayType() != GlobalNamespace::NoteData_GameplayType::Normal) return;
   AssignedPrefabKind kind = noteData->get_cutDirection().value__ == GlobalNamespace::NoteCutDirection::Any.value__
       ? AssignedPrefabKind::AnyDirectionObject
       : AssignedPrefabKind::Object;
   auto infos = Runtime::Instance().FindAssignedPrefabs("colorNotes", noteData, kind);
   if (!infos.empty()) {
+    Runtime::Instance().ForceGameObjectRenderersOnTop(self->get_gameObject().unsafePtr());
     Runtime::Instance().ReplaceNoteVisuals(self, infos);
   }
 }
@@ -3281,19 +3317,23 @@ MAKE_HOOK_MATCH(BombNoteController_Init, &GlobalNamespace::BombNoteController::I
   BombNoteController_Init(self, noteData, noteSpawnData);
   Runtime::Instance().RestoreNoteVisuals(self);
   if (Runtime::Instance().GetCurrentBeatmapData() == nullptr || Runtime::Instance().IsResetting()) return;
-  Runtime::Instance().ForceGameObjectRenderersOnTop(self->get_gameObject().unsafePtr());
   auto infos = Runtime::Instance().FindAssignedPrefabs("bombNotes", noteData, AssignedPrefabKind::Object);
-  if (!infos.empty()) Runtime::Instance().ReplaceNoteVisuals(self, infos);
+  if (!infos.empty()) {
+    Runtime::Instance().ForceGameObjectRenderersOnTop(self->get_gameObject().unsafePtr());
+    Runtime::Instance().ReplaceNoteVisuals(self, infos);
+  }
 }
 MAKE_HOOK_MATCH(BurstSliderGameNoteController_Init, &GlobalNamespace::BurstSliderGameNoteController::Init, void, GlobalNamespace::BurstSliderGameNoteController* self, GlobalNamespace::NoteData* noteData, ByRef<GlobalNamespace::NoteSpawnData> noteSpawnData, GlobalNamespace::NoteVisualModifierType noteVisualModifierType, float uniformScale) {
   BurstSliderGameNoteController_Init(self, noteData, noteSpawnData, noteVisualModifierType, uniformScale);
   Runtime::Instance().RestoreNoteVisuals(self);
   if (Runtime::Instance().GetCurrentBeatmapData() == nullptr || Runtime::Instance().IsResetting()) return;
-  Runtime::Instance().ForceGameObjectRenderersOnTop(self->get_gameObject().unsafePtr());
   if (noteData == nullptr) return;
   auto* objectType = noteData->get_gameplayType() == GlobalNamespace::NoteData_GameplayType::BurstSliderHead ? "burstSliders" : "burstSliderElements";
   auto infos = Runtime::Instance().FindAssignedPrefabs(objectType, noteData, AssignedPrefabKind::Object);
-  if (!infos.empty()) Runtime::Instance().ReplaceNoteVisuals(self, infos);
+  if (!infos.empty()) {
+    Runtime::Instance().ForceGameObjectRenderersOnTop(self->get_gameObject().unsafePtr());
+    Runtime::Instance().ReplaceNoteVisuals(self, infos);
+  }
 }
 MAKE_HOOK_MATCH(NoteCutCoreEffectsSpawner_SpawnNoteCutEffect, &GlobalNamespace::NoteCutCoreEffectsSpawner::SpawnNoteCutEffect, void, GlobalNamespace::NoteCutCoreEffectsSpawner* self, ByRef<GlobalNamespace::NoteCutInfo> noteCutInfo, GlobalNamespace::NoteController* noteController, int32_t sparkleParticlesCount, int32_t explosionParticlesCount) {
   if (Runtime::Instance().GetCurrentBeatmapData() == nullptr || Runtime::Instance().IsResetting()) {

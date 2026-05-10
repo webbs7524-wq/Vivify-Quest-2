@@ -1,17 +1,32 @@
-param(
-    [switch]$clean
+Param(
+    [Parameter(Mandatory=$false)]
+    [Switch] $clean,
+
+    [Parameter(Mandatory=$false)]
+    [Switch] $help
 )
 
-$ErrorActionPreference = "Stop"
-$root = Split-Path -Parent $PSScriptRoot
-Set-Location $root
+if ($help -eq $true) {
+    Write-Output "`"Build`" - Copiles your mod into a `".so`" or a `".a`" library"
+    Write-Output "`n-- Arguments --`n"
 
-if ($clean -and (Test-Path "$root/build")) {
-    Remove-Item -LiteralPath "$root/build" -Recurse -Force
+    Write-Output "-Clean `t`t Deletes the `"build`" folder, so that the entire library is rebuilt"
+
+    exit
 }
 
-qpm restore
-$ndk = (qpm ndk resolve).Trim()
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_ANDROID_NDK="$ndk"
-cmake --build build --config RelWithDebInfo
+# if user specified clean, remove all build files
+if ($clean.IsPresent) {
+    if (Test-Path -Path "build") {
+        remove-item build -R -Force 
+    }
+}
 
+
+if (($clean.IsPresent) -or (-not (Test-Path -Path "build"))) {
+    new-item -Path build -ItemType Directory
+} 
+
+& cmake -G "Ninja" -DCMAKE_BUILD_TYPE="RelWithDebInfo" -B build
+& cmake --build ./build
+exit $LASTEXITCODE

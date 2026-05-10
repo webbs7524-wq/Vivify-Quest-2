@@ -1,10 +1,51 @@
-
 bool SameBlitData(BlitMaterialData const& left, BlitMaterialData const& right) {
   return left.material == right.material &&
          left.priority == right.priority &&
          left.source == right.source &&
          left.targets == right.targets &&
          left.pass == right.pass;
+}
+std::optional<std::string_view> ReadBlitAssetName(rapidjson::Value const& json) {
+  if (auto asset = ReadStringView(json, "asset")) return asset;
+  if (auto material = ReadStringView(json, "material")) return material;
+  if (auto effect = ReadStringView(json, "effect")) return effect;
+  if (auto postMaterial = ReadStringView(json, "postProcessMaterial")) return postMaterial;
+  if (auto postMaterial = ReadStringView(json, "postProcessingMaterial")) return postMaterial;
+  return std::nullopt;
+}
+PostProcessingOrder ParsePostProcessingOrder(rapidjson::Value const& json) {
+  if (auto beforeMain = ReadBool(json, "beforeMainEffect"); beforeMain.has_value()) {
+    return beforeMain.value() ? PostProcessingOrder::BeforeMainEffect : PostProcessingOrder::AfterMainEffect;
+  }
+  if (auto afterMain = ReadBool(json, "afterMainEffect"); afterMain.has_value()) {
+    return afterMain.value() ? PostProcessingOrder::AfterMainEffect : PostProcessingOrder::BeforeMainEffect;
+  }
+  auto order = ReadStringView(json, "order");
+  if (!order.has_value()) order = ReadStringView(json, "phase");
+  if (!order.has_value()) order = ReadStringView(json, "timing");
+  if (!order.has_value()) return PostProcessingOrder::AfterMainEffect;
+  std::string normalized = NormalizeAssetKey(*order);
+  if (normalized == "beforemaineffect" || normalized == "beforemain" ||
+      normalized == "before" || normalized == "pre") {
+    return PostProcessingOrder::BeforeMainEffect;
+  }
+  return PostProcessingOrder::AfterMainEffect;
+}
+void RemoveMatchingBlitEffects(std::vector<ActiveBlitEffect>& effects,
+                               BlitMaterialData const& filter,
+                               bool filterAsset,
+                               bool filterSource,
+                               bool filterTargets,
+                               bool filterPriority,
+                               bool filterPass) {
+  effects.erase(std::remove_if(effects.begin(), effects.end(), [&](ActiveBlitEffect const& active) {
+    if (filterAsset && active.data.asset != filter.asset) return false;
+    if (filterSource && active.data.source != filter.source) return false;
+    if (filterTargets && active.data.targets != filter.targets) return false;
+    if (filterPriority && active.data.priority != filter.priority) return false;
+    if (filterPass && active.data.pass != filter.pass) return false;
+    return true;
+  }), effects.end());
 }
 void AddOrUpdateBlitEffect(std::vector<ActiveBlitEffect>& effects, ActiveBlitEffect effect) {
   auto existing = std::find_if(effects.begin(), effects.end(), [&](ActiveBlitEffect const& active) {
@@ -16,7 +57,7 @@ void AddOrUpdateBlitEffect(std::vector<ActiveBlitEffect>& effects, ActiveBlitEff
       existing->expireTime = 0.0f;
     } else {
       existing->data.frame.reset();
-      existing->expireTime = std::max(existing->expireTime, effect.expireTime);
+      existing->expireTime = effect.expireTime <= 0.0f ? 0.0f : std::max(existing->expireTime, effect.expireTime);
     }
   } else {
     effects.emplace_back(std::move(effect));
@@ -28,12 +69,14 @@ void AddOrUpdateBlitEffect(std::vector<ActiveBlitEffect>& effects, ActiveBlitEff
     effects.erase(effects.begin());
   }
 }
-void HandleBlit(CustomJSONData::CustomEventData* customEventData, rapidjson::Value const& json) {
-  auto asset = ReadStringView(json, "asset");
+void HandleBlit(CustomJSONData::CustomEventData* customEventData, rapidjson::Value const& json,
+                std::string_view eventType = kBlitEvent) {
+  auto asset = ReadBlitAssetName(json);
   std::string normalizedAsset = asset.has_value() ? NormalizeAssetKey(*asset) : std::string();
   if (GetDisableAllBlits()) {
     if (GetVivifyDebugLogging()) {
-      PaperLogger.info("Vivify Blit skipped at beat {}: Disable All Blits enabled asset='{}'",
+      PaperLogger.info("Vivify {} skipped at beat {}: Disable All Blits enabled asset='{}'",
+                       std::string(eventType),
                        customEventData->time,
                        asset.has_value() ? std::string(*asset) : std::string("<none>"));
     }
@@ -43,24 +86,26 @@ void HandleBlit(CustomJSONData::CustomEventData* customEventData, rapidjson::Val
     if (GetDisableBeat0FilmgrainBlit() && std::fabs(customEventData->time) < 0.01f &&
         normalizedAsset.find("filmgrain") != std::string::npos) {
       if (GetVivifyDebugLogging()) {
-        PaperLogger.info("Vivify Blit skipped at beat {}: beat-0 filmgrain isolation asset='{}'",
-                         customEventData->time, std::string(*asset));
+        PaperLogger.info("Vivify {} skipped at beat {}: beat-0 filmgrain isolation asset='{}'",
+                         std::string(eventType), customEventData->time, std::string(*asset));
       }
       return;
     }
   }
+  bool clear = ReadBool(json, "clear").value_or(false) || ReadBool(json, "remove").value_or(false) ||
+               ReadBool(json, "enabled").value_or(true) == false;
   UnityEngine::Material* material = nullptr;
-  if (asset.has_value()) {
+  if (asset.has_value() && !clear) {
     material = GetAssetAs<UnityEngine::Material>(*asset);
     if (material == nullptr) {
       if (GetVivifyDebugLogging()) {
-        PaperLogger.warn("Vivify Blit material load failed at beat {}: asset='{}'",
-                         customEventData->time, std::string(*asset));
+        PaperLogger.warn("Vivify {} material load failed at beat {}: asset='{}'",
+                         std::string(eventType), customEventData->time, std::string(*asset));
       }
       return;
     }
     RepairMaterialShader(material, *asset);
-    LogMaterialShader("Blit", *asset, material);
+    LogMaterialShader(eventType, *asset, material);
     auto properties = ParseMaterialProperties(json);
     if (!properties.empty()) {
       float dur = DurationBeatsToSeconds(ReadFloat(json, "duration").value_or(0.0f));
@@ -96,8 +141,29 @@ void HandleBlit(CustomJSONData::CustomEventData* customEventData, rapidjson::Val
     }
   }
   if (targets.empty()) targets.emplace_back("_Main");
-  auto orderStr = ReadStringView(json, "order");
-  bool pre = orderStr.has_value() && *orderStr == "BeforeMainEffect";
+  bool pre = ParsePostProcessingOrder(json) == PostProcessingOrder::BeforeMainEffect;
+  auto& effects = pre ? _preEffects : _postEffects;
+  float durationBeats = ReadFloat(json, "duration").value_or(0.0f);
+  float duration = DurationBeatsToSeconds(durationBeats);
+  BlitMaterialData bd{material, priority, sourceStr, targets, pass, std::nullopt, normalizedAsset, customEventData->time};
+  if (clear) {
+    bool const filterAsset = asset.has_value();
+    bool const filterSource = ReadValuePtr(json, "source") != nullptr;
+    bool const filterTargets = destVal != nullptr;
+    bool const filterPriority = ReadValuePtr(json, "priority") != nullptr;
+    bool const filterPass = ReadValuePtr(json, "pass") != nullptr;
+    RemoveMatchingBlitEffects(effects, bd, filterAsset, filterSource, filterTargets, filterPriority, filterPass);
+    if (GetVivifyDebugLogging()) {
+      PaperLogger.info("Vivify {} cleared: beat={} asset='{}' source='{}' targets={} order={}",
+                       std::string(eventType),
+                       customEventData->time,
+                       asset.has_value() ? std::string(*asset) : std::string("<any>"),
+                       filterSource ? sourceStr : std::string("<any>"),
+                       filterTargets ? targets.size() : 0,
+                       pre ? "BeforeMainEffect" : "AfterMainEffect");
+    }
+    return;
+  }
   if (GetVivifyDebugLogging()) {
     std::string targetLog;
     for (auto const& target : targets) {
@@ -106,7 +172,8 @@ void HandleBlit(CustomJSONData::CustomEventData* customEventData, rapidjson::Val
     }
     auto* shader = material != nullptr ? material->get_shader().unsafePtr() : nullptr;
     PaperLogger.info(
-        "Vivify Blit event: beat={} asset='{}' shader='{}' source='{}' targets='{}' priority={} pass={} order={} durationBeats={} xrOcclusionMesh={}",
+        "Vivify {} event: beat={} asset='{}' shader='{}' source='{}' targets='{}' priority={} pass={} order={} durationBeats={} persistent={} xrOcclusionMesh={}",
+        std::string(eventType),
         customEventData->time,
         asset.has_value() ? std::string(*asset) : std::string("<none>"),
         ShaderNameForLog(shader),
@@ -115,14 +182,14 @@ void HandleBlit(CustomJSONData::CustomEventData* customEventData, rapidjson::Val
         priority,
         pass,
         pre ? "BeforeMainEffect" : "AfterMainEffect",
-        ReadFloat(json, "duration").value_or(0.0f),
+        durationBeats,
+        BoolText(durationBeats < 0.0f),
         BoolText(UnityEngine::XR::XRSettings::get_useOcclusionMesh()));
   }
-  auto& effects = pre ? _preEffects : _postEffects;
-  float duration = DurationBeatsToSeconds(ReadFloat(json, "duration").value_or(0.0f));
   float songTime = CurrentSongTime();
-  BlitMaterialData bd{material, priority, sourceStr, targets, pass, std::nullopt, normalizedAsset, customEventData->time};
-  if (duration == 0) {
+  if (durationBeats < 0.0f) {
+    AddOrUpdateBlitEffect(effects, ActiveBlitEffect{bd, 0.0f});
+  } else if (duration == 0) {
     bd.frame = static_cast<int>(UnityEngine::Time::get_frameCount());
     AddOrUpdateBlitEffect(effects, ActiveBlitEffect{bd, 0.0f});
   } else if (duration > 0 && songTime <= customEventData->time + duration) {
@@ -174,13 +241,43 @@ void HandleCreateScreenTexture(rapidjson::Value const& json) {
   if (auto w = ReadInt(json, "width")) dt.width = *w;
   if (auto h = ReadInt(json, "height")) dt.height = *h;
   if (auto fmt = ReadStringView(json, "colorFormat"))
-    dt.format = Parsing::ParseRenderTextureFormat(*fmt);
+    dt.format = [&]() -> std::optional<UnityEngine::RenderTextureFormat> {
+      auto s = *fmt;
+      if (s == "ARGB32") return UnityEngine::RenderTextureFormat::ARGB32;
+      if (s == "Depth") return UnityEngine::RenderTextureFormat::Depth;
+      if (s == "ARGBHalf") return UnityEngine::RenderTextureFormat::ARGBHalf;
+      if (s == "Shadowmap") return UnityEngine::RenderTextureFormat::Shadowmap;
+      if (s == "RGB565") return UnityEngine::RenderTextureFormat::RGB565;
+      if (s == "ARGB4444") return UnityEngine::RenderTextureFormat::ARGB4444;
+      if (s == "ARGB1555") return UnityEngine::RenderTextureFormat::ARGB1555;
+      if (s == "Default") return UnityEngine::RenderTextureFormat::Default;
+      if (s == "ARGBFloat") return UnityEngine::RenderTextureFormat::ARGBFloat;
+      if (s == "RGFloat") return UnityEngine::RenderTextureFormat::RGFloat;
+      if (s == "RFloat") return UnityEngine::RenderTextureFormat::RFloat;
+      if (s == "RHalf") return UnityEngine::RenderTextureFormat::RHalf;
+      if (s == "R8") return UnityEngine::RenderTextureFormat::R8;
+      if (s == "DefaultHDR") return UnityEngine::RenderTextureFormat::DefaultHDR;
+      return std::nullopt;
+    }();
   if (auto fm = ReadStringView(json, "filterMode"))
-    dt.filterMode = Parsing::ParseFilterMode(*fm);
+    dt.filterMode = [&]() -> std::optional<UnityEngine::FilterMode> {
+      auto s = *fm;
+      if (s == "Point") return UnityEngine::FilterMode::Point;
+      if (s == "Bilinear") return UnityEngine::FilterMode::Bilinear;
+      if (s == "Trilinear") return UnityEngine::FilterMode::Trilinear;
+      return std::nullopt;
+    }();
   if (dt.xRatio <= 0.0f) dt.xRatio = 1.0f;
   if (dt.yRatio <= 0.0f) dt.yRatio = 1.0f;
-  int w = std::clamp(dt.width.value_or(1024), 1, kMaxRenderTextureSize);
-  int h = std::clamp(dt.height.value_or(512), 1, kMaxRenderTextureSize);
+  int baseW = 1024;
+  int baseH = 512;
+  auto mainCam = UnityEngine::Camera::get_main();
+  if (IsAlive(mainCam)) {
+    baseW = std::max(1, mainCam->get_pixelWidth());
+    baseH = std::max(1, mainCam->get_pixelHeight());
+  }
+  int w = std::clamp(dt.width.value_or(baseW), 1, kMaxRenderTextureSize);
+  int h = std::clamp(dt.height.value_or(baseH), 1, kMaxRenderTextureSize);
   w = static_cast<int>(w / dt.xRatio);
   h = static_cast<int>(h / dt.yRatio);
   w = std::clamp(w, 1, kMaxRenderTextureSize);
@@ -317,11 +414,46 @@ void HandleCreateCamera(rapidjson::Value const& json) {
   ApplyCameraProperties(cam.camera, cam.properties);
   _secondaryCameras[name] = std::move(cam);
 }
+std::optional<UnityEngine::DepthTextureMode> ParseDepthTextureModeName(std::string_view s) {
+  if (s == "None") return UnityEngine::DepthTextureMode::None;
+  if (s == "Depth") return UnityEngine::DepthTextureMode::Depth;
+  if (s == "DepthNormals") return UnityEngine::DepthTextureMode::DepthNormals;
+  if (s == "MotionVectors") return UnityEngine::DepthTextureMode::MotionVectors;
+  return std::nullopt;
+}
+std::optional<UnityEngine::DepthTextureMode> ParseDepthTextureModeValue(rapidjson::Value const& value) {
+  if (value.IsString()) {
+    return ParseDepthTextureModeName(std::string_view(value.GetString(), value.GetStringLength()));
+  }
+  if (!value.IsArray()) {
+    return std::nullopt;
+  }
+
+  int flags = 0;
+  bool parsedAny = false;
+  for (auto const& item : value.GetArray()) {
+    if (!item.IsString()) continue;
+    auto mode = ParseDepthTextureModeName(std::string_view(item.GetString(), item.GetStringLength()));
+    if (!mode.has_value()) continue;
+    flags |= mode->value__;
+    parsedAny = true;
+  }
+  if (!parsedAny) return std::nullopt;
+  return UnityEngine::DepthTextureMode(flags);
+}
 void ParseCameraPropertyData(rapidjson::Value const& json, CameraPropertyData& out) {
-  if (auto dtm = ReadStringView(json, "depthTextureMode"))
-    out.depthTextureMode = Parsing::ParseDepthTextureMode(*dtm);
+  if (auto* dtm = ReadValuePtr(json, "depthTextureMode")) {
+    out.depthTextureMode = ParseDepthTextureModeValue(*dtm);
+  }
   if (auto cf = ReadStringView(json, "clearFlags"))
-    out.clearFlags = Parsing::ParseClearFlags(*cf);
+    out.clearFlags = [&]() -> std::optional<UnityEngine::CameraClearFlags> {
+      auto s = *cf;
+      if (s == "Skybox") return UnityEngine::CameraClearFlags::Skybox;
+      if (s == "Color" || s == "SolidColor") return UnityEngine::CameraClearFlags::Color;
+      if (s == "Depth") return UnityEngine::CameraClearFlags::Depth;
+      if (s == "Nothing") return UnityEngine::CameraClearFlags::Nothing;
+      return std::nullopt;
+    }();
   auto* bgVal = ReadValuePtr(json, "backgroundColor");
   if (bgVal != nullptr && bgVal->IsArray() && bgVal->Size() >= 3) {
     auto arr = bgVal->GetArray();
@@ -572,8 +704,11 @@ void HandleAssignObjectPrefab(CustomJSONData::CustomEventData*, rapidjson::Value
     auto asset = ReadAssetValue(objVal, key);
     if (asset.state == AssetValueState::Missing) return;
     if (asset.state == AssetValueState::Null) {
-      ClearAssignedPrefabs(objType, kind, saberType);
+      ClearAssignedPrefabs(objType, kind, saberType, &tracks);
       return;
+    }
+    if (!additive) {
+      ClearAssignedPrefabs(objType, kind, saberType, &tracks);
     }
     AddAssignedPrefab(objType, kind, std::move(asset.value), std::move(tracks), additive, saberType);
   };
@@ -583,6 +718,9 @@ void HandleAssignObjectPrefab(CustomJSONData::CustomEventData*, rapidjson::Value
     if (asset.state == AssetValueState::Null) {
       ClearAssignedPrefabs("saber", AssignedPrefabKind::Trail, saberType);
       return;
+    }
+    if (!additive) {
+      ClearAssignedPrefabs("saber", AssignedPrefabKind::Trail, saberType);
     }
     AddAssignedTrail(std::move(asset.value),
                      additive,
@@ -597,14 +735,12 @@ void HandleAssignObjectPrefab(CustomJSONData::CustomEventData*, rapidjson::Value
   auto processTrackedObject = [&](std::string_view objType) {
     auto* objVal = ReadValuePtr(json, objType);
     if (objVal == nullptr || !objVal->IsObject()) return;
-    if (!additive) ClearAssignedPrefabs(objType);
     auto tracks = ReadTracks(*objVal, v2);
     applyAsset(*objVal, objType, AssignedPrefabKind::Object, "asset", tracks);
     applyAsset(*objVal, objType, AssignedPrefabKind::Debris, "debrisAsset", tracks);
   };
 
   if (auto* colorNotes = ReadValuePtr(json, "colorNotes"); colorNotes != nullptr && colorNotes->IsObject()) {
-    if (!additive) ClearAssignedPrefabs("colorNotes");
     auto tracks = ReadTracks(*colorNotes, v2);
     applyAsset(*colorNotes, "colorNotes", AssignedPrefabKind::Object, "asset", tracks);
     applyAsset(*colorNotes, "colorNotes", AssignedPrefabKind::AnyDirectionObject, "anyDirectionAsset", tracks);
